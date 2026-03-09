@@ -30,7 +30,7 @@ jobs:
         uses: android-actions/setup-android@v3
 
       - name: Install dependencies
-        run: npm ci || npm install --legacy-peer-deps
+        run: corepack enable && yarn set version classic && yarn install
 
       - name: Prebuild Expo Android
         run: npx expo prebuild --platform android --clean
