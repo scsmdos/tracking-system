@@ -30,19 +30,23 @@ jobs:
         uses: android-actions/setup-android@v3
 
       - name: Install dependencies
-        run: corepack enable && yarn set version classic && yarn install
+        run: npm install
+
+      - name: Set NODE_ENV
+        run: echo "NODE_ENV=production" >> $GITHUB_ENV
 
       - name: Prebuild Expo Android
-        run: npx expo prebuild --platform android --clean
+        run: npx expo prebuild --platform android --clean --no-install
 
-      - name: Build Android Release APK
+      - name: Build Android Debug APK
         run: |
           cd android
           chmod +x gradlew
-          ./gradlew assembleRelease
+          ./gradlew assembleDebug --no-daemon
 
       - name: Upload APK Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: app-release
-          path: android/app/build/outputs/apk/release/app-release.apk
+          name: app-debug
+          path: android/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
