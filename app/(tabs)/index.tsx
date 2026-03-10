@@ -1,16 +1,14 @@
 import { useState, useEffect, useRef } from 'react';
 import { View, Text, StyleSheet, TouchableOpacity, Dimensions, Platform, Alert, ActivityIndicator } from 'react-native';
 import { useLocalSearchParams } from 'expo-router';
-import MapView, { Marker, PROVIDER_GOOGLE, Polyline, Circle } from 'react-native-maps';
+import MapView, { Marker, Polyline, Circle } from 'react-native-maps';
 import * as Location from 'expo-location';
-import * as TaskManager from 'expo-task-manager';
 import * as Battery from 'expo-battery';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { Play, Square, Navigation, Clock, Gauge, Layers, Info } from 'lucide-react-native';
 import { MaterialCommunityIcons } from '@expo/vector-icons';
 import { API_URL } from '../../constants/Api';
-
-const LOCATION_TASK_NAME = 'background-location-task';
+import { LOCATION_TASK_NAME } from '../../utils/backgroundTasks';
 const { width, height } = Dimensions.get('window');
 
 interface LocationPoint {
@@ -20,35 +18,6 @@ interface LocationPoint {
   speed?: number | null;
 }
 
-// Define background task
-TaskManager.defineTask(LOCATION_TASK_NAME, async ({ data, error }: any) => {
-  if (error) return;
-  if (data) {
-    const { locations } = data;
-    const session = await AsyncStorage.getItem('user_session');
-    if (!session) return;
-    
-    const user = JSON.parse(session);
-    const batteryLevel = await Battery.getBatteryLevelAsync();
-    
-    const cache = locations.map((l: any) => ({
-      lat: l.coords.latitude,
-      lng: l.coords.longitude,
-      ts: l.timestamp,
-      speed: l.coords.speed,
-      accuracy: l.coords.accuracy,
-      battery: Math.round(batteryLevel * 100)
-    }));
-    
-    try {
-      await fetch(`${API_URL}/sync-locations`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
-        body: JSON.stringify({ username: user.username, locations: cache, status: 'ONLINE' })
-      });
-    } catch (err) {}
-  }
-});
 
 export default function DashboardScreen() {
   const [location, setLocation] = useState<any>(null);
@@ -56,7 +25,7 @@ export default function DashboardScreen() {
   const [currentUser, setCurrentUser] = useState<any>(null);
   const [history, setHistory] = useState<LocationPoint[]>([]);
   const [stays, setStays] = useState<any[]>([]);
-  const [mapType, setMapType] = useState<any>('standard'); 
+  const [mapType, setMapType] = useState<any>('standard');
   const [showTraffic, setShowTraffic] = useState(false);
   const [batteryLevel, setBatteryLevel] = useState(0);
   const mapRef = useRef<MapView>(null);
@@ -66,7 +35,7 @@ export default function DashboardScreen() {
     checkTrackingStatus();
     requestPermissions();
     getBatteryInfo();
-    
+
     const batterySub = Battery.addBatteryLevelListener(({ batteryLevel }) => {
       setBatteryLevel(Math.round(batteryLevel * 100));
     });
@@ -97,7 +66,7 @@ export default function DashboardScreen() {
         }));
         setHistory(points);
         detectStays(points);
-        
+
         // Center map on last location
         const last = points[points.length - 1];
         setLocation(last);
@@ -125,17 +94,46 @@ export default function DashboardScreen() {
     setIsTracking(started);
   };
 
+  const [permissionError, setPermissionError] = useState('');
+  const [isCalibrating, setIsCalibrating] = useState(true);
+
   const requestPermissions = async () => {
-    const { status: foreground } = await Location.requestForegroundPermissionsAsync();
-    if (foreground === 'granted') {
+    setIsCalibrating(true);
+    setPermissionError('');
+    try {
+      const { status: foreground } = await Location.requestForegroundPermissionsAsync();
+      if (foreground !== 'granted') {
+        setPermissionError('Foreground location permission is REQUIRED to track your duty.');
+        setIsCalibrating(false);
+        return;
+      }
+
       await Location.requestBackgroundPermissionsAsync();
-      const loc = await Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.High });
+      
+      // Wait max 10 seconds for initial location to prevent getting stuck
+      const loc = await Promise.race([
+        Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.Balanced }),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 10000))
+      ]) as Location.LocationObject;
+
       setLocation(loc.coords);
-      setHistory([{ 
-        latitude: loc.coords.latitude, 
-        longitude: loc.coords.longitude, 
-        timestamp: Date.now() 
+      setHistory([{
+        latitude: loc.coords.latitude,
+        longitude: loc.coords.longitude,
+        timestamp: Date.now()
       }]);
+      setIsCalibrating(false);
+
+    } catch (e: any) {
+      console.warn("GPS Lock Error:", e);
+      if (e.message === 'timeout') {
+         setPermissionError('GPS calibration timed out. Please ensure you have a clear view of the sky.');
+      } else {
+         setPermissionError('Failed to get GPS lock. Please turn on Location services.');
+      }
+      // Fallback location to allow map to render
+      setLocation({ latitude: 20.5937, longitude: 78.9629, speed: 0 } as any); 
+      setIsCalibrating(false);
     }
   };
 
@@ -153,10 +151,17 @@ export default function DashboardScreen() {
         }
         Alert.alert("Duty Ended", "Your status is now OFFLINE.");
       } else {
+        // Must request background permissions immediately before starting
+        const { status: background } = await Location.requestBackgroundPermissionsAsync();
+        if (background !== 'granted') {
+           Alert.alert("Permission Required", "Background location 'Allow all the time' is required for tracking.");
+           return;
+        }
+
         await Location.startLocationUpdatesAsync(LOCATION_TASK_NAME, {
-          accuracy: Location.Accuracy.BestForNavigation,
-          timeInterval: 3000, 
-          distanceInterval: 1,  
+          accuracy: Location.Accuracy.Balanced, // Use Balanced instead of BestForNavigation to avoid crashes
+          timeInterval: 5000, 
+          distanceInterval: 10,  
           foregroundService: {
             notificationTitle: "TMS Secure Tracking Active",
             notificationBody: "Monitoring location for fleet security",
@@ -174,8 +179,9 @@ export default function DashboardScreen() {
         fetchHistoryByDate(new Date().toISOString().split('T')[0]); 
         Alert.alert("Shift Started", "Your status is now ONLINE.");
       }
-    } catch (err) {
-      Alert.alert("Error", "Failed to start tracking.");
+    } catch (err: any) {
+      console.warn("Toggle tracking error:", err);
+      Alert.alert("Error", "Failed to start tracking. Please ensure location permissions are fully granted.");
     }
   };
 
@@ -189,10 +195,10 @@ export default function DashboardScreen() {
       }, (loc) => {
         setLocation(loc.coords);
         setHistory(prev => {
-          const updated = [...prev, { 
-            latitude: loc.coords.latitude, 
-            longitude: loc.coords.longitude, 
-            timestamp: loc.timestamp 
+          const updated = [...prev, {
+            latitude: loc.coords.latitude,
+            longitude: loc.coords.longitude,
+            timestamp: loc.timestamp
           }];
           detectStays(updated);
           return updated;
@@ -214,7 +220,7 @@ export default function DashboardScreen() {
       const dist = getDistance(stayStart.latitude, stayStart.longitude, current.latitude, current.longitude);
       const timeDiff = (current.timestamp - stayStart.timestamp) / 60000;
 
-      if (dist > 0.02) { 
+      if (dist > 0.02) {
         if (timeDiff >= 2) {
           detected.push({ lat: stayStart.latitude, lng: stayStart.longitude, duration: Math.round(timeDiff) });
         }
@@ -226,42 +232,55 @@ export default function DashboardScreen() {
 
   const getDistance = (lat1: number, lon1: number, lat2: number, lon2: number) => {
     const R = 6371;
-    const dLat = (lat2-lat1)*Math.PI/180;
-    const dLon = (lon2-lon1)*Math.PI/180;
-    const a = Math.sin(dLat/2)*Math.sin(dLat/2) + Math.cos(lat1*Math.PI/180)*Math.cos(lat2*Math.PI/180)*Math.sin(dLon/2)*Math.sin(dLon/2);
-    return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+    const dLat = (lat2 - lat1) * Math.PI / 180;
+    const dLon = (lon2 - lon1) * Math.PI / 180;
+    const a = Math.sin(dLat / 2) * Math.sin(dLat / 2) + Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) * Math.sin(dLon / 2) * Math.sin(dLon / 2);
+    return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
   };
 
-  if (!location) return (
+  if (isCalibrating) return (
     <View style={styles.loading}>
       <ActivityIndicator size="large" color="#1E40AF" />
       <Text style={styles.loadingText}>Calibrating GPS...</Text>
     </View>
   );
 
+  if (permissionError || !location) return (
+    <View style={styles.errorContainer}>
+      <MaterialCommunityIcons name="map-marker-off" size={60} color="#DC2626" />
+      <Text style={styles.errorTitle}>Location Required</Text>
+      <Text style={styles.errorDesc}>{permissionError || "Unable to determine your location."}</Text>
+      <TouchableOpacity style={styles.retryBtn} onPress={requestPermissions}>
+        <Text style={styles.retryBtnText}>Retry GPS Calibration</Text>
+      </TouchableOpacity>
+    </View>
+  );
+
   return (
     <View style={styles.container}>
-      <MapView
-        ref={mapRef}
-        style={styles.map}
-        provider={PROVIDER_GOOGLE}
-        mapType={mapType}
-        showsTraffic={showTraffic}
-        initialRegion={{
-          latitude: location.latitude,
-          longitude: location.longitude,
-          latitudeDelta: 0.005,
-          longitudeDelta: 0.005,
-        }}
-      >
-        <Polyline coordinates={history} strokeColor="#1E40AF" strokeWidth={5} lineDashPattern={[0]} />
-        {stays.map((s, i) => (
-          <Circle key={i} center={{ latitude: s.lat, longitude: s.lng }} radius={20} fillColor="rgba(239, 68, 68, 0.4)" strokeColor="#EF4444" />
-        ))}
-        <Marker coordinate={location}>
-          <View style={styles.markerContainer}><View style={styles.markerInner} /></View>
-        </Marker>
-      </MapView>
+      {/* Wrapped MapView in a basic View to catch layout-level issues */}
+      <View style={styles.mapContainer}>
+        <MapView
+          ref={mapRef}
+          style={styles.map}
+          mapType={mapType}
+          showsTraffic={showTraffic}
+          initialRegion={{
+            latitude: location.latitude,
+            longitude: location.longitude,
+            latitudeDelta: 0.005,
+            longitudeDelta: 0.005,
+          }}
+        >
+          <Polyline coordinates={history} strokeColor="#1E40AF" strokeWidth={5} lineDashPattern={[0]} />
+          {stays.map((s, i) => (
+            <Circle key={i} center={{ latitude: s.lat, longitude: s.lng }} radius={20} fillColor="rgba(239, 68, 68, 0.4)" strokeColor="#EF4444" />
+          ))}
+          <Marker coordinate={location}>
+            <View style={styles.markerContainer}><View style={styles.markerInner} /></View>
+          </Marker>
+        </MapView>
+      </View>
 
       <View style={styles.mapControls}>
         <TouchableOpacity style={styles.controlBtn} onPress={() => setMapType(mapType === 'standard' ? 'satellite' : 'standard')}>
@@ -282,8 +301,8 @@ export default function DashboardScreen() {
               <Text style={styles.statusText}>{isTracking ? 'TRACKING LIVE' : 'OFFLINE'}</Text>
             </View>
             <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
-               <MaterialCommunityIcons name="battery-charging" size={14} color="#64748B" />
-               <Text style={styles.timeText}>{batteryLevel}%</Text>
+              <MaterialCommunityIcons name="battery-charging" size={14} color="#64748B" />
+              <Text style={styles.timeText}>{batteryLevel}%</Text>
             </View>
           </View>
 
@@ -304,7 +323,7 @@ export default function DashboardScreen() {
             </View>
           </View>
 
-          <TouchableOpacity 
+          <TouchableOpacity
             style={[styles.actionButton, isTracking ? styles.stopButton : styles.startButton]}
             onPress={toggleTracking}
             activeOpacity={0.9}
@@ -322,6 +341,7 @@ const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: '#FFF' },
   loading: { flex: 1, justifyContent: 'center', alignItems: 'center' },
   loadingText: { marginTop: 12, fontSize: 14, color: '#64748B', fontWeight: '700' },
+  mapContainer: { flex: 1, overflow: 'hidden' },
   map: { width, height },
   mapControls: { position: 'absolute', top: 60, right: 16, gap: 12 },
   controlBtn: { width: 50, height: 60, borderRadius: 12, backgroundColor: '#FFF', alignItems: 'center', justifyContent: 'center', elevation: 5, shadowColor: '#000', shadowOpacity: 0.1, shadowRadius: 10 },
@@ -342,4 +362,9 @@ const styles = StyleSheet.create({
   actionButtonText: { color: '#FFF', fontSize: 16, fontWeight: '900', letterSpacing: 1 },
   markerContainer: { width: 30, height: 30, borderRadius: 15, backgroundColor: 'rgba(30, 64, 175, 0.2)', alignItems: 'center', justifyContent: 'center' },
   markerInner: { width: 12, height: 12, borderRadius: 6, backgroundColor: '#1E40AF', borderWidth: 2, borderColor: '#FFF' },
+  errorContainer: { flex: 1, backgroundColor: '#FFF', alignItems: 'center', justifyContent: 'center', padding: 24 },
+  errorTitle: { fontSize: 24, fontWeight: '900', color: '#1E293B', marginTop: 20, marginBottom: 8 },
+  errorDesc: { fontSize: 14, color: '#64748B', textAlign: 'center', marginBottom: 30, lineHeight: 22 },
+  retryBtn: { backgroundColor: '#1E40AF', paddingHorizontal: 24, paddingVertical: 14, borderRadius: 12, elevation: 2, shadowColor: '#1E40AF', shadowOpacity: 0.3, shadowRadius: 8, shadowOffset: { width: 0, height: 4 } },
+  retryBtnText: { color: '#FFF', fontSize: 16, fontWeight: 'bold' }
 });
