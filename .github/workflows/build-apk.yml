@@ -38,15 +38,28 @@ jobs:
       - name: Prebuild Expo Android
         run: npx expo prebuild --platform android --clean --no-install
 
-      - name: Build Android Debug APK
+      - name: Build Android Release APK
         run: |
           cd android
           chmod +x gradlew
-          ./gradlew assembleDebug --no-daemon
+          ./gradlew assembleRelease --no-daemon
 
-      - name: Upload APK Artifact
+      - name: Sign APK
+        run: |
+          # Generate a temporary keystore
+          keytool -genkey -v -keystore my-release-key.keystore -alias my-key-alias -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=TMS, OU=TMS, O=TMS, L=TMS, S=TMS, C=US" -storepass password -keypass password
+          
+          # Find apksigner
+          export BUILD_TOOLS_DIR=$ANDROID_HOME/build-tools
+          export LATEST_BUILD_TOOLS=$(ls -1d $BUILD_TOOLS_DIR/* | sort -V | tail -n 1)
+          export APKSIGNER=$LATEST_BUILD_TOOLS/apksigner
+          
+          # Sign the unsigned release APK
+          $APKSIGNER sign --ks my-release-key.keystore --ks-pass pass:password --ks-key-alias my-key-alias --key-pass pass:password --out android/app/build/outputs/apk/release/app-release.apk android/app/build/outputs/apk/release/app-release-unsigned.apk
+
+      - name: Upload Signed Release APK Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: app-debug
-          path: android/app/build/outputs/apk/debug/app-debug.apk
+          name: app-release
+          path: android/app/build/outputs/apk/release/app-release.apk
           if-no-files-found: error
